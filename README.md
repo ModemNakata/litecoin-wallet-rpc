@@ -11,7 +11,7 @@ A lightweight, FastAPI-based microservice providing RPC interaction with the Lit
 
 ## Tech Stack
 
-- **Python 3.12**
+- **Python 3.12** - (bip_utils can be incompatible with other versions)
 - **FastAPI** - Web framework
 - **bip_utils** - HD wallet derivation
 - **Electrum Protocol** - Blockchain data via raw RPC connections to ElectrumX servers (TCP)
@@ -31,6 +31,16 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 gunicorn main:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000
 # production run
+
+
+# or use recommended by FastAPI team way to run
+# (pip install fastapi[standard])
+
+fastapi dev
+# development
+
+fastapi run
+# production
 ```
 
 API documentation will be available at:

@@ -1,0 +1,2 @@
+bip_utils==2.12.1
+fastapi==0.135.3
