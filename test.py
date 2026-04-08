@@ -82,3 +82,6 @@ if ADDR_NUM > 0:
     print(f"\nScript hash conversion:")
     print(f"  Address: {ltc_address}")
     print(f"  Script hash (ElectrumX format): {scripthash}")
+
+# get script hash of address with balance and txs for a test
+print("script hash 0.25: " + address_to_scripthash("ltc1qjxk9zg06kewc0xrqflzmwwaqsdd9dqzjm72qq2"))
