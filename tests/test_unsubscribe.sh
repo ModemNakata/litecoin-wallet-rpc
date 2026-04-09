@@ -38,8 +38,15 @@ BEFORE_COUNT=$(echo "$BEFORE" | jq '.total_subscriptions')
 echo -e "${YELLOW}Current subscriptions: $BEFORE_COUNT${NC}"
 echo ""
 
-# Build JSON array of script hashes
-HASHES_JSON=$(printf '"%s"' "${SCRIPT_HASHES[@]}" | sed 's/" "/", "/g')
+# Build JSON array of script hashes using printf with commas
+HASHES_JSON=""
+for hash in "${SCRIPT_HASHES[@]}"; do
+    if [ -z "$HASHES_JSON" ]; then
+        HASHES_JSON="\"$hash\""
+    else
+        HASHES_JSON="$HASHES_JSON, \"$hash\""
+    fi
+done
 PAYLOAD="{\"script_hashes\": [$HASHES_JSON]}"
 
 # Unsubscribe

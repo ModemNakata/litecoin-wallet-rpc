@@ -3,14 +3,25 @@ import json
 import ssl
 import logging
 import os
+from pathlib import Path
 from typing import Optional
 import datetime as dt
 from datetime import datetime
 from contextlib import asynccontextmanager
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from bip_utils import Bip39MnemonicGenerator, Bip39WordsNum
+from bip_utils import Bip39MnemonicGenerator, Bip39WordsNum, P2WPKHAddrDecoder
+import hashlib
+
+# Load environment variables from .env file
+env_path = os.getenv("ENV_FILE", ".env")
+if Path(env_path).exists():
+    load_dotenv(env_path)
+    env_source = f"from {env_path}"
+else:
+    env_source = "from system environment"
 
 # Configure logging to use a proper logger instead of uvicorn.error
 logging.basicConfig(
@@ -18,10 +29,52 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)-8s] %(name)s - %(message)s",
 )
 log = logging.getLogger(__name__)
+log.info(f"Loaded environment {env_source}")
 
 # Suppress overly verbose uvicorn logging
-logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+# logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+# logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+
+
+# ============================================================================
+# Address Conversion Utilities
+# ============================================================================
+
+
+def get_address_hrp() -> str:
+    """Get the HRP (Human Readable Part) for addresses based on testnet flag."""
+    is_testnet = os.getenv("TESTNET", "false").lower() == "true"
+    return "tltc" if is_testnet else "ltc"
+
+
+def address_to_scripthash(address: str) -> str:
+    """
+    Convert a Litecoin/Litecoin-testnet bech32 address (P2WPKH) to ElectrumX-compatible script hash.
+
+    Args:
+        address: Litecoin bech32 address (starting with ltc1 or tltc1)
+
+    Returns:
+        Script hash as hex string in little-endian format (ElectrumX format)
+    """
+    try:
+        # Decode the bech32 address to get the witness program
+        decoder = P2WPKHAddrDecoder()
+        hrp = get_address_hrp()
+        witness_program = decoder.DecodeAddr(address, hrp=hrp)
+
+        # For P2WPKH, ScriptPubKey is 0x0014 + 20-byte witness program
+        script_pubkey = bytes.fromhex("0014") + witness_program
+
+        # Compute SHA256 hash of the scriptPubKey
+        script_hash = hashlib.sha256(script_pubkey).digest()
+
+        # Convert to little-endian (reverse byte order) for ElectrumX
+        script_hash_le = script_hash[::-1]
+
+        return script_hash_le.hex()
+    except Exception as e:
+        raise ValueError(f"Failed to convert address to script hash: {e}")
 
 
 # ============================================================================
@@ -29,17 +82,54 @@ logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
 # ============================================================================
 
 
-class BalanceRequest(BaseModel):
+class AddressRequest(BaseModel):
+    """Request with wallet addresses instead of script hashes."""
+
+    addresses: list[str]
+
+
+class ScriptHashRequest(BaseModel):
+    """Request with script hashes."""
+
     script_hashes: list[str]
+
+
+class BalanceRequest(BaseModel):
+    """Request for balance (supports both addresses and script hashes)."""
+
+    script_hashes: Optional[list[str]] = None
+    addresses: Optional[list[str]] = None
+
+    def get_script_hashes(self) -> list[str]:
+        """Get script hashes, converting addresses if needed."""
+        if self.script_hashes:
+            return self.script_hashes
+        elif self.addresses:
+            return [address_to_scripthash(addr) for addr in self.addresses]
+        else:
+            raise ValueError("Either script_hashes or addresses must be provided")
 
 
 class SubscribeRequest(BaseModel):
-    script_hashes: list[str]
+    """Subscribe request."""
+
+    script_hashes: Optional[list[str]] = None
+    addresses: Optional[list[str]] = None
     webhook_url: Optional[str] = None
+
+    def get_script_hashes(self) -> list[str]:
+        """Get script hashes, converting addresses if needed."""
+        if self.script_hashes:
+            return self.script_hashes
+        elif self.addresses:
+            return [address_to_scripthash(addr) for addr in self.addresses]
+        else:
+            raise ValueError("Either script_hashes or addresses must be provided")
 
 
 class BalanceResponse(BaseModel):
     script_hash: str
+    address: Optional[str] = None
     confirmed: int
     unconfirmed: int
     confirmed_ltc: float
@@ -49,6 +139,7 @@ class BalanceResponse(BaseModel):
 
 class TransactionResponse(BaseModel):
     script_hash: str
+    address: Optional[str] = None
     tx_hash: str
     height: int
     fee: Optional[int] = None
@@ -242,7 +333,7 @@ class SubscriptionManager:
 
             if webhook_url:
                 self._subscribed_hashes[script_hash]["webhook_url"] = webhook_url
-                self.logger.info(f"  - Webhook: {webhook_url}")
+                # self.logger.info(f"  - Webhook: {webhook_url}")
 
     async def unsubscribe(self, script_hash: str) -> bool:
         """Unsubscribe from updates for a script hash. Returns True if was subscribed."""
@@ -312,8 +403,8 @@ async def lifespan(app: FastAPI):
     enable_electrumx = os.getenv("ENABLE_ELECTRUMX", "true").lower() == "true"
 
     if enable_electrumx:
-        electrum_host = os.getenv("ELECTRUMX_HOST", "5.161.216.180")
-        electrum_port = int(os.getenv("ELECTRUMX_PORT", "50002"))
+        electrum_host = os.getenv("ELECTRUMX_HOST")
+        electrum_port = int(os.getenv("ELECTRUMX_PORT"))
 
         electrum_client = ElectrumXClient(host=electrum_host, port=electrum_port)
 
@@ -356,12 +447,17 @@ async def generate_seed():
 
 @app.post("/balance", response_model=list[BalanceResponse])
 async def get_balances(request: BalanceRequest):
-    """Get balances for script hashes (batch operation, list-first)."""
+    """Get balances for addresses or script hashes (batch operation, list-first)."""
     if not electrum_client:
         raise HTTPException(status_code=503, detail="ElectrumX not connected")
 
+    try:
+        script_hashes = request.get_script_hashes()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     results = []
-    for script_hash in request.script_hashes:
+    for script_hash in script_hashes:
         try:
             result = await electrum_client.get_balance(script_hash)
             await subscription_manager.store_result(script_hash, result)
@@ -385,12 +481,17 @@ async def get_balances(request: BalanceRequest):
 
 @app.post("/history", response_model=list[TransactionResponse])
 async def get_history_batch(request: BalanceRequest):
-    """Get transaction history for script hashes (batch operation, list-first)."""
+    """Get transaction history for addresses or script hashes (batch operation, list-first)."""
     if not electrum_client:
         raise HTTPException(status_code=503, detail="ElectrumX not connected")
 
+    try:
+        script_hashes = request.get_script_hashes()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     all_results = []
-    for script_hash in request.script_hashes:
+    for script_hash in script_hashes:
         try:
             results = await electrum_client.get_history(script_hash)
             all_results.extend(results)
@@ -402,12 +503,17 @@ async def get_history_batch(request: BalanceRequest):
 
 @app.post("/subscribe")
 async def subscribe(request: SubscribeRequest):
-    """Subscribe to updates for script hashes."""
+    """Subscribe to updates for addresses or script hashes."""
     if not subscription_manager:
         raise HTTPException(status_code=503, detail="Service not ready")
 
+    try:
+        script_hashes = request.get_script_hashes()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     subscribed = []
-    for script_hash in request.script_hashes:
+    for script_hash in script_hashes:
         await subscription_manager.subscribe(script_hash, request.webhook_url)
         subscribed.append(script_hash)
 
@@ -421,12 +527,17 @@ async def subscribe(request: SubscribeRequest):
 
 @app.delete("/subscribe")
 async def unsubscribe_batch(request: BalanceRequest):
-    """Unsubscribe from updates for script hashes (batch operation)."""
+    """Unsubscribe from updates for addresses or script hashes (batch operation)."""
     if not subscription_manager:
         raise HTTPException(status_code=503, detail="Service not ready")
 
+    try:
+        script_hashes = request.get_script_hashes()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     unsubscribed = []
-    for script_hash in request.script_hashes:
+    for script_hash in script_hashes:
         was_subscribed = await subscription_manager.unsubscribe(script_hash)
         unsubscribed.append(
             {"script_hash": script_hash, "was_subscribed": was_subscribed}

@@ -27,8 +27,15 @@ for i in "${!SCRIPT_HASHES[@]}"; do
 done
 echo ""
 
-# Build JSON array of script hashes
-HASHES_JSON=$(printf '"%s"' "${SCRIPT_HASHES[@]}" | sed 's/" "/", "/g')
+# Build JSON array of script hashes using printf with commas
+HASHES_JSON=""
+for hash in "${SCRIPT_HASHES[@]}"; do
+    if [ -z "$HASHES_JSON" ]; then
+        HASHES_JSON="\"$hash\""
+    else
+        HASHES_JSON="$HASHES_JSON, \"$hash\""
+    fi
+done
 PAYLOAD="{\"script_hashes\": [$HASHES_JSON], \"webhook_url\": \"https://webhook.example.com/notify\"}"
 
 # Subscribe without webhook
