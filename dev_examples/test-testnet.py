@@ -14,8 +14,7 @@ import hashlib
 ADDR_NUM: int = 5
 
 # Generate random mnemonic
-mnemonic = "hole melody tuna erode basket poem stairs exile vicious envelope atom deliver quantum domain enjoy lucky wage picture coast great bachelor climb real pony"
-# mnemonic = Bip39MnemonicGenerator().FromWordsNumber(Bip39WordsNum.WORDS_NUM_24)
+mnemonic = Bip39MnemonicGenerator().FromWordsNumber(Bip39WordsNum.WORDS_NUM_24)
 print(f"Mnemonic string: {mnemonic}")
 # Generate seed from mnemonic
 seed_bytes = Bip39SeedGenerator(mnemonic).Generate()

@@ -1,10 +1,10 @@
 #!/bin/bash
-# Test: Unsubscribe from script hash updates
+# Test: Unsubscribe from script hash updates (wallet addresses now)
 
 set -e
 
 BASE_URL="http://localhost:8000"
-SCRIPT_HASHES_FILE="$(dirname "$0")/script_hashes.txt"
+SCRIPT_HASHES_FILE="$(dirname "$0")/wallet_addresses.txt"
 
 # Colors
 GREEN='\033[0;32m'

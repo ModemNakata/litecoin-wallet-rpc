@@ -1,10 +1,10 @@
 #!/bin/bash
-# Test: Subscribe to script hash updates
+# Test: Subscribe to script hash updates (wallet_addresses with updated API)
 
 set -e
 
 BASE_URL="http://localhost:8000"
-SCRIPT_HASHES_FILE="$(dirname "$0")/script_hashes.txt"
+SCRIPT_HASHES_FILE="$(dirname "$0")/wallet_addresses.txt"
 
 # Colors
 GREEN='\033[0;32m'

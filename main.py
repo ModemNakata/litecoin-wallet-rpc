@@ -100,14 +100,32 @@ class BalanceRequest(BaseModel):
     script_hashes: Optional[list[str]] = None
     addresses: Optional[list[str]] = None
 
-    def get_script_hashes(self) -> list[str]:
-        """Get script hashes, converting addresses if needed."""
+    def get_script_hashes_with_mapping(self) -> tuple[list[str], dict[str, str]]:
+        """Get script hashes and address mapping, hashing only once."""
+        mapping = {}
+        script_hashes = []
+        
         if self.script_hashes:
-            return self.script_hashes
+            script_hashes = self.script_hashes
         elif self.addresses:
-            return [address_to_scripthash(addr) for addr in self.addresses]
+            for addr in self.addresses:
+                script_hash = address_to_scripthash(addr)
+                script_hashes.append(script_hash)
+                mapping[script_hash] = addr
         else:
             raise ValueError("Either script_hashes or addresses must be provided")
+        
+        return script_hashes, mapping
+
+    def get_script_hashes(self) -> list[str]:
+        """Get script hashes, converting addresses if needed (single hash operation)."""
+        script_hashes, _ = self.get_script_hashes_with_mapping()
+        return script_hashes
+
+    def get_script_hash_to_address_map(self) -> dict[str, str]:
+        """Get mapping of script_hash to address if addresses were provided."""
+        _, mapping = self.get_script_hashes_with_mapping()
+        return mapping
 
 
 class SubscribeRequest(BaseModel):
@@ -117,14 +135,32 @@ class SubscribeRequest(BaseModel):
     addresses: Optional[list[str]] = None
     webhook_url: Optional[str] = None
 
-    def get_script_hashes(self) -> list[str]:
-        """Get script hashes, converting addresses if needed."""
+    def get_script_hashes_with_mapping(self) -> tuple[list[str], dict[str, str]]:
+        """Get script hashes and address mapping, hashing only once."""
+        mapping = {}
+        script_hashes = []
+        
         if self.script_hashes:
-            return self.script_hashes
+            script_hashes = self.script_hashes
         elif self.addresses:
-            return [address_to_scripthash(addr) for addr in self.addresses]
+            for addr in self.addresses:
+                script_hash = address_to_scripthash(addr)
+                script_hashes.append(script_hash)
+                mapping[script_hash] = addr
         else:
             raise ValueError("Either script_hashes or addresses must be provided")
+        
+        return script_hashes, mapping
+
+    def get_script_hashes(self) -> list[str]:
+        """Get script hashes, converting addresses if needed (single hash operation)."""
+        script_hashes, _ = self.get_script_hashes_with_mapping()
+        return script_hashes
+
+    def get_script_hash_to_address_map(self) -> dict[str, str]:
+        """Get mapping of script_hash to address if addresses were provided."""
+        _, mapping = self.get_script_hashes_with_mapping()
+        return mapping
 
 
 class BalanceResponse(BaseModel):
@@ -319,10 +355,23 @@ class SubscriptionManager:
     def __init__(self):
         self._subscribed_hashes: dict[
             str, dict
-        ] = {}  # {script_hash: {webhook_url, ...}}
+        ] = {}  # {script_hash: {webhook_url, address, ...}}
         self._hash_results: dict[str, dict] = {}  # {script_hash: balance_data}
+        self._script_hash_to_address: dict[str, str] = {}  # {script_hash: address}
         self._lock = asyncio.Lock()
         self.logger = logging.getLogger(f"{__name__}.SubscriptionManager")
+
+    async def map_script_hash(self, script_hash: str, address: Optional[str] = None):
+        """Map a script hash to its original address."""
+        async with self._lock:
+            if address:
+                self._script_hash_to_address[script_hash] = address
+                self.logger.debug(f"Mapped {script_hash} -> {address}")
+
+    async def get_address_for_script_hash(self, script_hash: str) -> Optional[str]:
+        """Get the original address for a script hash."""
+        async with self._lock:
+            return self._script_hash_to_address.get(script_hash)
 
     async def subscribe(self, script_hash: str, webhook_url: Optional[str] = None):
         """Subscribe to updates for a script hash."""
@@ -338,11 +387,18 @@ class SubscriptionManager:
     async def unsubscribe(self, script_hash: str) -> bool:
         """Unsubscribe from updates for a script hash. Returns True if was subscribed."""
         async with self._lock:
+            was_subscribed = False
             if script_hash in self._subscribed_hashes:
                 del self._subscribed_hashes[script_hash]
                 self.logger.info(f"Unsubscribed from: {script_hash}")
-                return True
-            return False
+                was_subscribed = True
+            
+            # Clean up the address mapping when unsubscribing
+            if script_hash in self._script_hash_to_address:
+                del self._script_hash_to_address[script_hash]
+                self.logger.debug(f"Cleared address mapping for: {script_hash}")
+            
+            return was_subscribed
 
     async def store_result(self, script_hash: str, result: dict):
         """Store balance result for a script hash."""
@@ -453,20 +509,32 @@ async def get_balances(request: BalanceRequest):
 
     try:
         script_hashes = request.get_script_hashes()
+        hash_to_addr = request.get_script_hash_to_address_map()
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    # Store the address mappings
+    for script_hash, address in hash_to_addr.items():
+        await subscription_manager.map_script_hash(script_hash, address)
 
     results = []
     for script_hash in script_hashes:
         try:
             result = await electrum_client.get_balance(script_hash)
+            
+            # Get the original address if available
+            address = await subscription_manager.get_address_for_script_hash(script_hash)
+            result["address"] = address
+            
             await subscription_manager.store_result(script_hash, result)
             results.append(result)
         except Exception as e:
             log.error(f"Error querying {script_hash}: {e}")
+            address = await subscription_manager.get_address_for_script_hash(script_hash)
             results.append(
                 {
                     "script_hash": script_hash,
+                    "address": address,
                     "confirmed": 0,
                     "unconfirmed": 0,
                     "confirmed_ltc": 0.0,
@@ -487,13 +555,23 @@ async def get_history_batch(request: BalanceRequest):
 
     try:
         script_hashes = request.get_script_hashes()
+        hash_to_addr = request.get_script_hash_to_address_map()
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    # Store the address mappings
+    for script_hash, address in hash_to_addr.items():
+        await subscription_manager.map_script_hash(script_hash, address)
 
     all_results = []
     for script_hash in script_hashes:
         try:
             results = await electrum_client.get_history(script_hash)
+            # Get the original address if available
+            address = await subscription_manager.get_address_for_script_hash(script_hash)
+            # Add address to each result
+            for result in results:
+                result["address"] = address
             all_results.extend(results)
         except Exception as e:
             log.error(f"Error querying history for {script_hash}: {e}")
