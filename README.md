@@ -56,6 +56,11 @@ ENV_FILE=.env
 uvicorn main:app --host 127.0.0.1 --port 8000
 # or for development with reload:
 uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+
+# or use FastAPI functionality (pip install fastapi[standard])
+fastapi dev
+# or
+fastapi run
 ```
 
 API documentation available at `http://localhost:8000/docs`.
