@@ -76,8 +76,8 @@ class TransactionsRequest(BaseModel):
 
 
 class DeriveRequest(BaseModel):
-    """Request for wallet address derivation from extended public key."""
-    xpub: str
+    """Request for wallet address derivation from extended key."""
+    xpub: str  # master private key (depth 0) or account public key (depth 3)
     account_index: int = 0
     address_index: int = 0
 

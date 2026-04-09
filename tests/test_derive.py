@@ -6,22 +6,22 @@ import json
 
 BASE_URL = "http://127.0.0.1:8000"
 
-# Configuration — change these values to test with your own xpub
-XPUB = "ttpv96BtqegdxXcePe8NvKZPJphxGobb5Jamsr47GuXdhWAQpLQowyG3rpWu3wiwLZ8ndJAwCBXJkrybBLsNnEBnmEb1m6MQFnwrJtooZKfFnUb"  # Replace with your account xpub (m/84'/2'/0')
+# Configuration — change these values to test with your own master private key
+XPRV = "ttpv96BtqegdxXcePe8..."  # Replace with your BIP84 master private key
 ACCOUNT_INDEX = 0
 ADDRESS_INDEX = 0
 
 print("\n" + "=" * 60)
 print("TEST: Address Derivation")
 print("=" * 60)
-print(f"XPUB: {XPUB[:20]}...")
+print(f"XPRV: {XPRV[:20]}...")
 print(f"Account index: {ACCOUNT_INDEX}")
 print(f"Address index: {ADDRESS_INDEX}")
 print()
 
 try:
     payload = {
-        "xpub": XPUB,
+        "xpub": XPRV,
         "account_index": ACCOUNT_INDEX,
         "address_index": ADDRESS_INDEX,
     }

@@ -1,33 +1,37 @@
 # Litecoin Wallet RPC Microservice
 
-A lightweight, FastAPI-based microservice providing RPC interaction with the Litecoin blockchain. Designed to be integrated into larger applications, this service handles wallet derivations and blockchain interactions through a clean REST API.
+A lightweight, FastAPI-based microservice providing RPC interaction with the Litecoin blockchain via ElectrumX servers. Designed to be integrated into larger applications, this service handles wallet derivations and blockchain interactions through a clean REST API.
 
-The project uses `asyncio` to establish a persistent TCP connection to an ElectrumX server.
+The project uses `asyncio` to establish a persistent connection to an ElectrumX server over TCP or SSL.
 Electrum Protocol Methods: https://electrumx.readthedocs.io/en/latest/protocol-methods.html
 
-All the script hashes are handled in memory, though SQLite can optionally be added in the future for persistence or Redis could beused to support distributed deployments.
-
-Subscriptions are not implemented yet (e.g. blockchain.scripthash.subscribe and blockchain.scripthash.unsubscribe).
-This will allow setting a webhook to forward notifications from the ElectrumX server when a wallet address balance changes.
-
-## Can be implemented in future:
-
-  - Caching to avoid rate-limiting by ElectrumX server
-  - Using multiple ElectrumX servers for failover (rotate server from list it's failed or rate-limited)
+All script hash conversions are handled in memory. SQLite can optionally be added in the future for persistence, or Redis to support distributed deployments.
 
 ## Features
 
-- **Wallet Derivation**: Uses `bip_utils` for hierarchical deterministic (HD) wallet key derivation (BIP84)
-- **Blockchain Interactions**: Connects to ElectrumX servers for raw blockchain data retrieval (UTXOs, transactions, balance checks, etc.)
-- **RESTful API**: Built with FastAPI for high performance and automatic documentation
-- **Microservice Architecture**: Designed to be consumed by other services in a distributed system
+- **Wallet Derivation**: Uses `bip_utils` for hierarchical deterministic (HD) wallet key derivation (BIP84) — derive addresses from a master private key or account public key
+- **Transaction History**: Get transaction history for multiple wallet addresses in a single batch request
+- **Transaction Details**: Fetch verbose transaction data for multiple tx hashes in a single batch request
+- **Health Check**: Monitor service connectivity
+- **Address-to-Script-Hash Conversion**: P2WPKH support for mainnet and testnet
+- **Comprehensive Error Handling**: Logging, connection recovery (1 reconnection attempt on failure)
+- **Batch Operations**: All blockchain queries are sent efficiently in a single batch
+
+## Future Features
+
+- Caching to avoid rate-limiting by ElectrumX servers
+- Using multiple ElectrumX servers for failover (rotate server from a list if failed or rate-limited)
+- Subscribe/unsubscribe to address notifications (`blockchain.scripthash.subscribe`) with webhook callbacks
+- Keepalive pings to maintain long-lived connections
+- WebSocket support for real-time updates
+- SQLite/Redis caching layer
 
 ## Tech Stack
 
-- **Python 3.12** - (bip_utils can be incompatible with other versions)
-- **FastAPI** - Web framework
-- **bip_utils** - HD wallet derivation
-- **Electrum Protocol** - Blockchain data via raw RPC connections to ElectrumX servers (TCP)
+- **Python 3.12** (`bip_utils` may be incompatible with other versions)
+- **FastAPI** — Web framework
+- **bip_utils** — HD wallet derivation (BIP39, BIP84)
+- **Electrum Protocol** — Blockchain data via raw RPC connections (TCP or SSL)
 
 ## Quick Start
 
@@ -36,70 +40,162 @@ This will allow setting a webhook to forward notifications from the ElectrumX se
 - Python 3.12
 - Access to an ElectrumX server (or run your own)
 
-### Running the Service
+### 1. Create `.env` file
 
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-# local development
-
-gunicorn main:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000
-# production run
-
-
-# or use recommended by FastAPI team way to run
-# (pip install fastapi[standard])
-
-fastapi dev
-# development
-
-fastapi run
-# production
+```
+ELECTRUMX_URL=ssl://electrum.ltc.xurious.com:51002
+TESTNET=true
+ENV_FILE=.env
 ```
 
-API documentation will be available at:
-- Swagger UI: `http://localhost:8000/docs`
+`ELECTRUMX_URL` format: `protocol://host:port` — supports `ssl://` and `tcp://`.
 
-<!-- ## API Endpoints -->
+### 2. Start the server
 
-<!-- ### Wallet Operations -->
-<!-- - `POST /wallet/derive` - Derive addresses from seed/mnemonic -->
-<!-- - `POST /wallet/generate-seed` - Generate a new BIP39 mnemonic seed -->
+```bash
+uvicorn main:app --host 127.0.0.1 --port 8000
+# or for development with reload:
+uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+```
 
-<!-- ### Blockchain Operations -->
-<!-- - `GET /address/{address}/balance` - Get address balance -->
-<!-- - `GET /address/{address}/transactions` - Get address transaction history -->
-<!-- - `GET /address/{address}/utxos` - Get unspent outputs for an address -->
-<!-- - `POST /transaction/get` - Retrieve transaction details -->
-<!-- - `POST /transaction/broadcast` - Broadcast a raw transaction -->
+API documentation available at `http://localhost:8000/docs`.
 
-<!-- ## Usage Example -->
+## API Endpoints
 
-<!-- ```python -->
-<!-- import requests -->
+### `GET /health`
 
-<!-- # Derive addresses from mnemonic -->
-<!-- response = requests.post("http://localhost:8000/wallet/derive", json={ -->
-<!-- "mnemonic": "your twelve word seed phrase here...", -->
-<!-- "derivation_path": "m/44'/2'/0'/0/0", -->
-<!-- "num_addresses": 5 -->
-<!-- }) -->
+Health check endpoint.
 
-<!-- # Check address balance -->
-<!-- response = requests.get("http://localhost:8000/address/ltc1qexample/balance") -->
-<!-- ``` -->
+**Response:**
+```json
+{
+  "status": "healthy",
+  "timestamp": "2026-04-09T20:00:00.000000+00:00"
+}
+```
 
-<!-- ## Project Structure -->
+### `POST /derive`
 
-<!-- ``` -->
-<!-- litecoin-wallet-rpc/ -->
-<!-- ├── app/ -->
-<!-- │   ├── main.py              # FastAPI application entrypoint -->
-<!-- │   ├── routes/              # API route definitions -->
-<!-- │   ├── services/            # Business logic (wallet, blockchain) -->
-<!-- │   └── schemas/             # Pydantic models -->
-<!-- ├── requirements.txt         # Python dependencies -->
-<!-- └── README.md -->
-<!-- ``` -->
+Derive a wallet address from a BIP84 extended key.
+
+Accepts either a **master private key** (depth 0, e.g. `ttpv...` / `xprv...`) or an **account public key** (depth 3, e.g. `ttub...` / `xpub...`).
+
+Derivation path: `m/84'/coin'/account_index'/0/address_index`
+
+> **Note**: Master *public* keys cannot derive hardened paths (`m/84'/...`). Use a master private key or an account-level public key.
+
+**Request:**
+```json
+{
+  "xpub": "ttpv96BtqegdxXcePe8...",
+  "account_index": 0,
+  "address_index": 0
+}
+```
+
+**Response:**
+```json
+{
+  "address": "tltc1q90mr483lhf9nmygyzz0sye8tpv42le4g2272mf",
+  "account_index": 0,
+  "address_index": 0,
+  "chain": "external"
+}
+```
+
+### `POST /history`
+
+Get transaction history for wallet addresses (batch operation).
+
+**Request:**
+```json
+{
+  "addresses": [
+    "tltc1qk8yyn8v267d5sr2tum8tq7djxdqf0vulhth62y",
+    "tltc1qg9dvsx67z38uwzl4xvucktdc5tx66xgduykar4"
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "tltc1qk8yyn8v267d5sr2tum8tq7djxdqf0vulhth62y": {
+    "transactions": [
+      { "height": 2500000, "tx_hash": "abc123..." },
+      { "height": 0, "fee": 1000, "tx_hash": "def456..." }
+    ],
+    "count": 2,
+    "timestamp": "2026-04-09T20:00:00.000000+00:00"
+  }
+}
+```
+
+### `POST /transactions`
+
+Get verbose transaction details for transaction hashes (batch operation).
+
+**Request:**
+```json
+{
+  "tx_hashes": [
+    "abc123def456abc123def456abc123def456abc123def456abc123def456abc1",
+    "fedcba987654fedcba987654fedcba987654fedcba987654fedcba987654fedc"
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "timestamp": "2026-04-09T20:00:00.000000+00:00",
+  "count": 2,
+  "transactions": [
+    {
+      "tx_hash": "abc123def456...",
+      "txid": "abc123def456...",
+      "version": 2,
+      "size": 225,
+      "vsize": 144,
+      "weight": 576,
+      "locktime": 0,
+      "vin": [...],
+      "vout": [...],
+      "confirmations": 1000,
+      "time": 1234567890,
+      "blocktime": 1234567890
+    },
+    {
+      "tx_hash": "fedcba987654...",
+      "error": "Transaction not found"
+    }
+  ]
+}
+```
+
+## Running Tests
+
+See [tests/README.md](tests/README.md) for test setup and usage instructions.
+
+## Error Handling
+
+| Scenario | Status | Detail |
+|---|---|---|
+| Invalid address | 400 | Descriptive error message |
+| Invalid tx hash | 400 | Must be 64-char hex string |
+| Invalid derivation key | 400 | Unsupported depth or malformed key |
+| Connection lost | 503 | After 1 reconnection attempt fails |
+| Query error | 500 | Error details logged on server |
+
+All errors are logged with full stack traces for debugging.
+
+## Logging
+
+The service logs:
+- Address-to-script-hash conversions
+- ElectrumX connection lifecycle (connect/disconnect)
+- All JSON-RPC requests and responses
+- Error details with full stack traces
 
 ## License
 
