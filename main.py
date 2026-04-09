@@ -206,36 +206,144 @@ class ElectrumXClient:
 
         return results
 
+    async def _batch_requests(self, requests_list: list[tuple]) -> list[dict]:
+        """Send multiple requests in batch and read all responses.
+        
+        Args:
+            requests_list: List of (method, params, request_id) tuples
+            
+        Returns:
+            List of responses indexed by request_id
+        """
+        self.logger.debug(f"Batch sending {len(requests_list)} requests")
+        
+        # Build all requests
+        raw_requests = []
+        request_ids = {}
+        for method, params, request_id in requests_list:
+            request = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+            raw_request = json.dumps(request).encode("utf-8") + b"\n"
+            raw_requests.append(raw_request)
+            request_ids[request_id] = method
+            self.logger.debug(f"  [{request_id}] {method}")
+
+        # Send all at once
+        async with self.read_lock:
+            for raw_request in raw_requests:
+                self.writer.write(raw_request)
+            await self.writer.drain()
+            self.logger.debug(f"✓ Sent {len(raw_requests)} requests in batch")
+
+            # Now read all responses
+            responses = {}
+            buffer = b""
+            expected_count = len(requests_list)
+            received_count = 0
+
+            while received_count < expected_count:
+                if b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    if line.strip():
+                        try:
+                            msg = json.loads(line.decode("utf-8"))
+                            self.logger.debug(f"<<< Received: {json.dumps(msg)}")
+                            msg_id = msg.get("id")
+                            self.logger.debug(f"    msg_id={msg_id}, in request_ids={msg_id in request_ids}, request_ids keys={list(request_ids.keys())}")
+
+                            if msg_id in request_ids:
+                                responses[msg_id] = msg
+                                received_count += 1
+                                self.logger.debug(f"    ✓ Counted! Now {received_count}/{expected_count}")
+                                
+                                # Check if we have all responses - break immediately
+                                if received_count >= expected_count:
+                                    self.logger.debug(f"✓ Got all {expected_count} responses, exiting read loop")
+                                    break
+                                    
+                            elif "method" in msg and "id" not in msg:
+                                # Server notification
+                                self.logger.info(f"[NOTIFICATION] {msg.get('method')}: {msg.get('params')}")
+                            else:
+                                self.logger.warning(f"[UNEXPECTED] {json.dumps(msg)}")
+                        except json.JSONDecodeError as e:
+                            self.logger.error(f"JSON decode error: {e}")
+
+                # Only try to read more if we still need responses
+                if received_count >= expected_count:
+                    break
+                    
+                try:
+                    chunk = await asyncio.wait_for(self.reader.read(4096), timeout=30)
+                except asyncio.TimeoutError:
+                    self.logger.error(f"Timeout: got {received_count}/{expected_count} responses")
+                    raise RuntimeError(f"Timeout waiting for batch responses (got {received_count}/{expected_count})")
+
+                if not chunk:
+                    if received_count >= expected_count:
+                        break
+                    self.logger.error(f"Connection closed: got {received_count}/{expected_count} responses")
+                    raise ConnectionError(f"Server closed connection after {received_count}/{expected_count} responses")
+
+                buffer += chunk
+                self.logger.debug(f"[BUFFER] Received {len(chunk)} bytes, have {received_count}/{expected_count} responses")
+
+        return [responses.get(req[2]) for req in requests_list]
+
     async def subscribe(self, script_hashes: list[str]):
-        """Subscribe to script hashes."""
+        """Subscribe to script hashes in batch."""
         self.logger.info(f"Subscribing to {len(script_hashes)} script hashes")
         
+        # Prepare batch requests
+        batch = []
         for script_hash in script_hashes:
-            try:
-                response = await self._send_request("blockchain.scripthash.subscribe", [script_hash])
-                if "error" in response:
-                    self.logger.error(f"Subscription failed for {script_hash}: {response['error']}")
-                else:
-                    status_hash = response.get("result")
-                    self.subscribed_hashes.add(script_hash)
-                    self.logger.info(f"✓ Subscribed to {script_hash[:16]}... (status: {status_hash[:16] if status_hash else 'None'}...)")
-            except Exception as e:
-                self.logger.error(f"Exception subscribing to {script_hash}: {e}")
+            self.request_id_counter += 1
+            batch.append(("blockchain.scripthash.subscribe", [script_hash], self.request_id_counter))
+        
+        # Send batch
+        responses = await self._batch_requests(batch)
+        
+        # Process responses
+        for (method, params, req_id), response in zip(batch, responses):
+            script_hash = params[0]
+            if response is None:
+                self.logger.error(f"No response for {script_hash[:16]}...")
+            elif "error" in response:
+                self.logger.error(f"Subscription failed for {script_hash[:16]}...: {response['error']}")
+            else:
+                status_hash = response.get("result")
+                self.subscribed_hashes.add(script_hash)
+                self.logger.info(f"✓ Subscribed to {script_hash[:16]}... (status: {status_hash[:16] if status_hash else 'None'}...)")
 
     async def unsubscribe(self, script_hashes: list[str]):
-        """Unsubscribe from script hashes."""
+        """Unsubscribe from script hashes in batch."""
         self.logger.info(f"Unsubscribing from {len(script_hashes)} script hashes")
         
+        # Prepare batch requests
+        batch = []
         for script_hash in script_hashes:
-            try:
-                response = await self._send_request("blockchain.scripthash.unsubscribe", [script_hash])
-                if "error" in response:
-                    self.logger.error(f"Unsubscribe failed for {script_hash}: {response['error']}")
+            self.request_id_counter += 1
+            batch.append(("blockchain.scripthash.unsubscribe", [script_hash], self.request_id_counter))
+        
+        # Send batch
+        responses = await self._batch_requests(batch)
+        
+        # Process responses
+        for (method, params, req_id), response in zip(batch, responses):
+            script_hash = params[0]
+            # Always remove from local tracking
+            self.subscribed_hashes.discard(script_hash)
+            
+            if response is None:
+                self.logger.error(f"No response for {script_hash[:16]}...")
+            elif "error" in response:
+                error = response['error']
+                if error.get('code') == -32601:
+                    self.logger.warning(f"Server doesn't support unsubscribe (needs v1.4.2+), removed locally: {script_hash[:16]}...")
                 else:
-                    self.subscribed_hashes.discard(script_hash)
-                    self.logger.info(f"✓ Unsubscribed from {script_hash[:16]}...")
-            except Exception as e:
-                self.logger.error(f"Exception unsubscribing from {script_hash}: {e}")
+                    self.logger.warning(f"Unsubscribe error for {script_hash[:16]}...: {error}")
+            else:
+                result = response.get("result")
+                self.logger.info(f"✓ Unsubscribed from {script_hash[:16]}... (was_subscribed: {result})")
 
     async def ping(self):
         """Send keepalive ping."""
