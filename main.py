@@ -13,7 +13,7 @@ import hashlib
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from bip_utils import P2WPKHAddrDecoder
+from bip_utils import P2WPKHAddrDecoder, Bip44Changes, Bip84, Bip84Coins
 from contextlib import asynccontextmanager
 
 
@@ -36,6 +36,7 @@ log = logging.getLogger(__name__)
 ELECTRUMX_URL = os.getenv("ELECTRUMX_URL", "ssl://localhost:50002")
 IS_TESTNET = os.getenv("TESTNET", "false").lower() == "true"
 ADDRESS_HRP = "tltc" if IS_TESTNET else "ltc"
+NETWORK_TYPE = Bip84Coins.LITECOIN_TESTNET if IS_TESTNET else Bip84Coins.LITECOIN
 
 log.info(f"Config: ElectrumX={ELECTRUMX_URL}, Testnet={IS_TESTNET}, HRP={ADDRESS_HRP}")
 
@@ -72,6 +73,13 @@ class HistoryRequest(BaseModel):
 class TransactionsRequest(BaseModel):
     """Request for transaction details."""
     tx_hashes: list[str]
+
+
+class DeriveRequest(BaseModel):
+    """Request for wallet address derivation from extended public key."""
+    xpub: str
+    account_index: int = 0
+    address_index: int = 0
 
 
 # ============================================================================
@@ -379,6 +387,32 @@ async def health():
         "status": "healthy" if electrum_client and electrum_client.connected else "unhealthy",
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
+
+
+@app.post("/derive")
+async def derive_address(request: DeriveRequest):
+    """Derive a wallet address from a master extended public key (BIP84).
+    
+    Derivation path: m/84'/coin'/account_index'/CHAIN_EXT/address_index
+    """
+    try:
+        # Load master xpub and derive: m/84'/coin'/account_index'/0/address_index
+        bip84_mst = Bip84.FromExtendedKey(request.xpub, NETWORK_TYPE)
+        bip84_acc = bip84_mst.Purpose().Coin().Account(request.account_index)
+        receiving_ctx = bip84_acc.Change(Bip44Changes.CHAIN_EXT)
+        address_ctx = receiving_ctx.AddressIndex(request.address_index)
+        
+        address = address_ctx.PublicKey().ToAddress()
+        
+        return {
+            "address": address,
+            "account_index": request.account_index,
+            "address_index": request.address_index,
+            "chain": "external"
+        }
+    except Exception as e:
+        log.error(f"Address derivation failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Derivation failed: {e}")
 
 
 @app.post("/history")
