@@ -60,7 +60,6 @@ print(f"\nMaster extended public key: {master_xpub}")
 print(f"Account extended public key (xpub): {account_xpub}")
 
 # Derive addresses from xpub only (no private key access needed)
-from bip_utils import Bip84
 xpub_ctx = Bip84.FromExtendedKey(account_xpub, NETWORK_TYPE)
 print("\nAddresses derived from xpub (watch-only):")
 xpub_receiving = xpub_ctx.Change(Bip44Changes.CHAIN_EXT)
