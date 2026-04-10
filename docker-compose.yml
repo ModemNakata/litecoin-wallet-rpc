@@ -2,7 +2,7 @@ services:
   litecoin-wallet-rpc:
     build: .
     ports:
-      - "127.0.0.1:8101:8101"
+      - "127.0.0.1:8101:8101" # bind to localhost, accessible outside docker network
     env_file:
       - .env
     environment:
