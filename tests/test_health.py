@@ -4,7 +4,7 @@
 import requests
 import json
 
-BASE_URL = "http://127.0.0.1:80101"
+BASE_URL = "http://127.0.0.1:8101"
 
 print("\n" + "=" * 60)
 print("TEST: Health Check")

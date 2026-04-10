@@ -2,7 +2,7 @@ services:
   litecoin-wallet-rpc:
     build: .
     ports:
-      - "127.0.0.1:80101:80101"
+      - "127.0.0.1:8101:8101"
     env_file:
       - .env
     environment:

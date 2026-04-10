@@ -5,7 +5,7 @@ import requests
 import json
 from pathlib import Path
 
-BASE_URL = "http://127.0.0.1:80101"
+BASE_URL = "http://127.0.0.1:8101"
 ADDRS_FILE = Path(__file__).parent / "addrs.txt"
 
 # Read addresses from file
