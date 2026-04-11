@@ -220,8 +220,33 @@ class ElectrumXClient:
                 self.logger.warning(f"Error disconnecting: {e}")
 
     async def reconnect(self, listener_callback=None):
-        """Reconnect to ElectrumX server."""
-        pass  # Removed reconnection logic
+        """Reconnect to ElectrumX server with exponential backoff."""
+        max_retries = 10
+        base_delay = 2
+        last_exception = None
+
+        for attempt in range(max_retries):
+            try:
+                self.logger.info(f"Reconnection attempt {attempt + 1}/{max_retries}...")
+                await self.disconnect()
+
+                # Exponential backoff: 2s, 4s, 8s, 16s, 30s (capped)
+                delay = min(base_delay * (2**attempt), 30)
+                self.logger.info(f"Waiting {delay}s before reconnect...")
+                await asyncio.sleep(delay)
+
+                await self.connect(listener_callback)
+                self.logger.info("✓ Reconnected successfully")
+                return  # Success
+            except Exception as e:
+                last_exception = e
+                self.logger.warning(f"Reconnection attempt {attempt + 1} failed: {e}")
+
+        self.logger.error(f"Failed to reconnect after {max_retries} attempts")
+        self.connected = False
+        raise ConnectionError(
+            f"Failed to reconnect after {max_retries} attempts: {last_exception}"
+        )
 
     async def _send_request(
         self,
@@ -317,12 +342,18 @@ class ElectrumXClient:
         self.logger.info("Starting notification listener")
         buffer = b""
 
-        while self.connected:
+        while True:
             try:
                 chunk = await asyncio.wait_for(self.reader.read(4096), timeout=60)
                 if not chunk:
-                    self.logger.warning("Connection closed")
-                    break
+                    self.logger.warning("Connection closed by server, reconnecting...")
+                    self.connected = False
+                    try:
+                        await self.reconnect(callback)
+                    except Exception as e:
+                        self.logger.error(f"Reconnection failed: {e}")
+                        break
+                    continue
 
                 buffer += chunk
 
@@ -351,7 +382,12 @@ class ElectrumXClient:
                 continue
             except Exception as e:
                 self.logger.error(f"Listener error: {e}")
-                break
+                self.connected = False
+                try:
+                    await self.reconnect(callback)
+                except Exception as reconnect_error:
+                    self.logger.error(f"Reconnection after error failed: {reconnect_error}")
+                    break
 
         self.logger.info("Notification listener stopped")
 
@@ -552,23 +588,6 @@ async def get_balance(request: BalanceRequest):
                 "unconfirmed": balance.get("unconfirmed", 0),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-        except ConnectionError as e:
-            log.warning(f"Connection lost: {e}, attempting to reconnect...")
-            try:
-                await electrum_client.disconnect()
-                await electrum_client.connect()
-                balance = await electrum_client.get_balance(script_hash)
-                response[address] = {
-                    "confirmed": balance.get("confirmed", 0),
-                    "unconfirmed": balance.get("unconfirmed", 0),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-            except Exception as retry_error:
-                log.error(f"Reconnection failed: {retry_error}")
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Failed to connect to ElectrumX: {retry_error}",
-                )
         except Exception as e:
             log.error(f"Error fetching balance for {address}: {e}")
             raise HTTPException(
@@ -646,23 +665,6 @@ async def get_history(request: HistoryRequest):
                 "count": len(history),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-        except ConnectionError as e:
-            log.warning(f"Connection lost: {e}, attempting to reconnect...")
-            try:
-                await electrum_client.disconnect()
-                await electrum_client.connect()
-                history = await electrum_client.get_history(script_hash)
-                response[address] = {
-                    "transactions": history,
-                    "count": len(history),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-            except Exception as retry_error:
-                log.error(f"Reconnection failed: {retry_error}")
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Failed to connect to ElectrumX: {retry_error}",
-                )
         except Exception as e:
             log.error(f"Error fetching history for {address}: {e}")
             raise HTTPException(
@@ -699,25 +701,6 @@ async def get_transactions(request: TransactionsRequest):
 
         return response
 
-    except ConnectionError as e:
-        log.warning(f"Connection lost: {e}, attempting to reconnect...")
-        try:
-            await electrum_client.disconnect()
-            await electrum_client.connect()
-            transactions = await electrum_client.get_transactions(request.tx_hashes)
-
-            response = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "count": len(transactions),
-                "transactions": transactions,
-            }
-
-            return response
-        except Exception as retry_error:
-            log.error(f"Reconnection failed: {retry_error}")
-            raise HTTPException(
-                status_code=503, detail=f"Failed to connect to ElectrumX: {retry_error}"
-            )
     except Exception as e:
         log.error(f"Error fetching transactions: {e}")
         raise HTTPException(status_code=500, detail=f"Error querying ElectrumX: {e}")
