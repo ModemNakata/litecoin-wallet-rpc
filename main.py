@@ -273,6 +273,56 @@ class ElectrumXClient:
         self.logger.info(f"✓ Got balance for {script_hash[:16]}...: {balance}")
         return balance
 
+    async def subscribe_headers(self, callback):
+        """Subscribe to block header notifications."""
+        self.logger.info("Subscribing to block headers")
+
+        response = await self._send_request("blockchain.headers.subscribe", [])
+
+        if "error" in response:
+            raise RuntimeError(f"Header subscribe failed: {response['error']}")
+
+        header = response.get("result", {})
+        self.logger.info(f"✓ Initial block height: {header.get('height')}")
+
+        return header
+
+    async def _listen_loop(self, callback):
+        """Listen for subscription notifications."""
+        self.logger.info("Starting notification listener")
+        buffer = b""
+
+        while self.connected:
+            try:
+                chunk = await asyncio.wait_for(self.reader.read(4096), timeout=60)
+                if not chunk:
+                    self.logger.warning("Connection closed, exiting listener")
+                    break
+
+                buffer += chunk
+
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    if line.strip():
+                        try:
+                            msg = json.loads(line.decode("utf-8"))
+                            if (
+                                "method" in msg
+                                and msg.get("method") == "blockchain.headers.subscribe"
+                            ):
+                                notification = msg.get("params", [{}])[0]
+                                await callback(notification)
+                        except json.JSONDecodeError:
+                            pass
+
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                self.logger.error(f"Listener error: {e}")
+                break
+
+        self.logger.info("Notification listener stopped")
+
     async def _batch_requests(self, requests_list: list[tuple]) -> list[dict]:
         """Send multiple requests in batch and read all responses.
 
@@ -417,6 +467,26 @@ class ElectrumXClient:
 # ============================================================================
 
 electrum_client: Optional[ElectrumXClient] = None
+current_block_height: int = 0
+current_block_hex: str = ""
+last_block_update: Optional[datetime] = None
+block_height_lock = asyncio.Lock()
+listener_task: Optional[asyncio.Task] = None
+
+
+async def on_new_block(header: dict):
+    """Callback for new block notifications."""
+    global current_block_height, current_block_hex, last_block_update
+
+    height = header.get("height", 0)
+    hex_val = header.get("hex", "")
+
+    async with block_height_lock:
+        current_block_height = height
+        current_block_hex = hex_val
+        last_block_update = datetime.now(timezone.utc)
+
+    log.info(f"New block detected: height={height}")
 
 
 # ============================================================================
@@ -427,7 +497,12 @@ electrum_client: Optional[ElectrumXClient] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown."""
-    global electrum_client
+    global \
+        electrum_client, \
+        listener_task, \
+        current_block_height, \
+        current_block_hex, \
+        last_block_update
 
     log.info("Starting Litecoin Wallet RPC (MVP)")
 
@@ -435,11 +510,30 @@ async def lifespan(app: FastAPI):
     electrum_client = ElectrumXClient(ELECTRUMX_URL)
     try:
         await electrum_client.connect()
+
+        # Subscribe to block headers
+        initial_header = await electrum_client.subscribe_headers(on_new_block)
+        current_block_height = initial_header.get("height", 0)
+        current_block_hex = initial_header.get("hex", "")
+        last_block_update = datetime.now(timezone.utc)
+
+        # Start listener task
+        listener_task = asyncio.create_task(electrum_client._listen_loop(on_new_block))
+
         yield
+
+        # Cleanup
+        if listener_task:
+            listener_task.cancel()
+            try:
+                await listener_task
+            except asyncio.CancelledError:
+                pass
+
         await electrum_client.disconnect()
     except Exception as e:
-        log.error(f"Error fetching transactions: {e}")
-        raise HTTPException(status_code=500, detail=f"Error querying ElectrumX: {e}")
+        log.error(f"Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {e}")
 
 
 # ============================================================================
@@ -507,3 +601,17 @@ async def get_balance(request: BalanceRequest):
             )
 
     return response
+
+
+@app.get("/block-height")
+async def get_block_height():
+    """Get current block height and last update timestamp."""
+    global last_block_update
+
+    async with block_height_lock:
+        return {
+            "height": current_block_height,
+            "hex": current_block_hex,
+            "last_update": last_block_update.isoformat() if last_block_update else None,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }

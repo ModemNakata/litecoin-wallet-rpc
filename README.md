@@ -13,6 +13,7 @@ All script hash conversions are handled in memory. SQLite can optionally be adde
 - **Transaction History**: Get transaction history for multiple wallet addresses in a single batch request
 - **Transaction Details**: Fetch verbose transaction data for multiple tx hashes in a single batch request
 - **Balance Query**: Get confirmed and unconfirmed balances for wallet addresses
+- **Block Height Subscription**: Real-time block height notifications via ElectrumX subscription
 - **Health Check**: Monitor service connectivity
 - **Address-to-Script-Hash Conversion**: P2WPKH support for mainnet and testnet
 - **Comprehensive Error Handling**: Logging, connection recovery (1 reconnection attempt on failure)
@@ -81,6 +82,20 @@ Health check endpoint.
 ```json
 {
   "status": "healthy",
+  "timestamp": "2026-04-09T20:00:00.000000+00:00"
+}
+```
+
+### `GET /block-height`
+
+Get current block height from header subscription (updated in real-time).
+
+**Response:**
+```json
+{
+  "height": 520481,
+  "hex": "00000020890208a0ae3a3892aa047c5468725846577cfcd9b512b50000000000000000005dc2b02f2d297a9064ee103036c14d678f9afc7e3d9409cf53fd58b82e938e8ecbeca05a2d2103188ce804c4",
+  "last_update": "2026-04-09T20:00:00.000000+00:00",
   "timestamp": "2026-04-09T20:00:00.000000+00:00"
 }
 ```
