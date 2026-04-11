@@ -107,9 +107,12 @@ class ElectrumXClient:
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
         self.request_id_counter = 0
-        self.read_lock = asyncio.Lock()
         self.logger = logging.getLogger(f"{__name__}.ElectrumXClient")
         self.connected = False
+        self._response_queue: asyncio.Queue = asyncio.Queue()
+        self._reader_task: Optional[asyncio.Task] = None
+        self._current_height: int = 0
+        self._current_hex: str = ""
 
     def _parse_url(self, url: str) -> tuple[str, str, int]:
         """Parse connection URL like ssl://host:port or tcp://host:port."""
@@ -136,7 +139,7 @@ class ElectrumXClient:
 
         return protocol, host, port
 
-    async def connect(self):
+    async def connect(self, listener_callback=None):
         """Connect to ElectrumX server."""
         try:
             self.logger.info(f"Connecting to {self.url} ({self.protocol.upper()})")
@@ -155,6 +158,17 @@ class ElectrumXClient:
 
             self.logger.info(f"✓ Connected to {self.url}")
 
+            # Mark as connected and start listener BEFORE any requests
+            self.connected = True
+
+            # Start listener if callback provided
+            if listener_callback:
+                self._reader_task = asyncio.create_task(
+                    self._listen_loop(listener_callback)
+                )
+                # Give it time to start
+                await asyncio.sleep(0.1)
+
             # Handshake
             response = await self._send_request(
                 "server.version", ["wallet-rpc", "1.4"], request_id=0
@@ -167,7 +181,19 @@ class ElectrumXClient:
                 f"✓ Handshake OK - Server: {server_info[0] if server_info else 'Unknown'}, Protocol: {server_info[1] if len(server_info) > 1 else 'Unknown'}"
             )
 
-            self.connected = True
+            # Subscribe to block headers
+            if listener_callback:
+                header_response = await self._send_request(
+                    "blockchain.headers.subscribe", []
+                )
+                if "error" in header_response:
+                    raise RuntimeError(
+                        f"Header subscribe failed: {header_response['error']}"
+                    )
+                header = header_response.get("result", {})
+                self._current_height = header.get("height", 0)
+                self._current_hex = header.get("hex", "")
+                self.logger.info(f"✓ Initial block height: {self._current_height}")
         except Exception as e:
             self.logger.error(f"Connection failed: {e}")
             self.connected = False
@@ -175,6 +201,13 @@ class ElectrumXClient:
 
     async def disconnect(self):
         """Disconnect from server."""
+        if self._reader_task:
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except asyncio.CancelledError:
+                pass
+
         if self.writer:
             try:
                 self.writer.close()
@@ -208,40 +241,23 @@ class ElectrumXClient:
 
         self.logger.debug(f">>> Sending: {method} (id={request_id})")
 
-        async with self.read_lock:
+        try:
             self.writer.write(raw_request)
             await self.writer.drain()
 
-            # Read response
-            buffer = b""
             while True:
-                if b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    if line.strip():
-                        try:
-                            msg = json.loads(line.decode("utf-8"))
-                            self.logger.debug(f"<<< Received: {json.dumps(msg)}")
-                            msg_id = msg.get("id")
-
-                            if msg_id == request_id:
-                                return msg
-                            else:
-                                self.logger.warning(
-                                    f"[UNEXPECTED] Got id={msg_id}, expected {request_id}: {json.dumps(msg)}"
-                                )
-                        except json.JSONDecodeError as e:
-                            self.logger.error(f"JSON decode error: {e}")
-
-                try:
-                    chunk = await asyncio.wait_for(self.reader.read(4096), timeout=30)
-                except asyncio.TimeoutError:
-                    raise RuntimeError("Timeout waiting for response")
-
-                if not chunk:
-                    raise ConnectionError("Server closed connection")
-
-                buffer += chunk
-                self.logger.debug(f"[BUFFER] Received {len(chunk)} bytes")
+                response = await asyncio.wait_for(
+                    self._response_queue.get(), timeout=30
+                )
+                msg_id = response.get("id")
+                if msg_id == request_id:
+                    return response
+                elif msg_id is not None:
+                    self.logger.warning(
+                        f"[UNEXPECTED] Got id={msg_id}, expected {request_id}"
+                    )
+        except asyncio.TimeoutError:
+            raise RuntimeError("Timeout waiting for response")
 
     async def get_history(self, script_hash: str) -> list[dict]:
         """Get transaction history for a script hash."""
@@ -283,12 +299,14 @@ class ElectrumXClient:
             raise RuntimeError(f"Header subscribe failed: {response['error']}")
 
         header = response.get("result", {})
-        self.logger.info(f"✓ Initial block height: {header.get('height')}")
+        self._current_height = header.get("height", 0)
+        self._current_hex = header.get("hex", "")
+        self.logger.info(f"✓ Initial block height: {self._current_height}")
 
         return header
 
     async def _listen_loop(self, callback):
-        """Listen for subscription notifications."""
+        """Listen for subscription notifications and dispatch responses via queue."""
         self.logger.info("Starting notification listener")
         buffer = b""
 
@@ -306,12 +324,21 @@ class ElectrumXClient:
                     if line.strip():
                         try:
                             msg = json.loads(line.decode("utf-8"))
-                            if (
+                            self.logger.debug(
+                                f"<<< Received: {json.dumps(msg)[:100]}..."
+                            )
+
+                            msg_id = msg.get("id")
+                            if msg_id is not None:
+                                await self._response_queue.put(msg)
+                            elif (
                                 "method" in msg
                                 and msg.get("method") == "blockchain.headers.subscribe"
                             ):
                                 notification = msg.get("params", [{}])[0]
                                 await callback(notification)
+                        except json.JSONDecodeError:
+                            pass
                         except json.JSONDecodeError:
                             pass
 
@@ -334,9 +361,6 @@ class ElectrumXClient:
         """
         self.logger.debug(f"Batch sending {len(requests_list)} requests")
 
-        # Build all requests
-        raw_requests = []
-        request_ids = set()
         for method, params, request_id in requests_list:
             request = {
                 "jsonrpc": "2.0",
@@ -345,86 +369,33 @@ class ElectrumXClient:
                 "params": params,
             }
             raw_request = json.dumps(request).encode("utf-8") + b"\n"
-            raw_requests.append(raw_request)
-            request_ids.add(request_id)
+            self.writer.write(raw_request)
             self.logger.debug(f"  [{request_id}] {method}")
 
-        # Send all at once
-        async with self.read_lock:
-            for raw_request in raw_requests:
-                self.writer.write(raw_request)
-            await self.writer.drain()
-            self.logger.debug(f"✓ Sent {len(raw_requests)} requests in batch")
+        await self.writer.drain()
+        self.logger.debug(f"✓ Sent {len(requests_list)} requests in batch")
 
-            # Now read all responses
-            responses = {}
-            buffer = b""
-            expected_count = len(requests_list)
-            received_count = 0
-
-            while received_count < expected_count:
-                if b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    if line.strip():
-                        try:
-                            msg = json.loads(line.decode("utf-8"))
-                            self.logger.debug(
-                                f"<<< Received: {json.dumps(msg)[:100]}..."
-                            )
-                            msg_id = msg.get("id")
-
-                            if msg_id in request_ids:
-                                responses[msg_id] = msg
-                                received_count += 1
-                                self.logger.debug(
-                                    f"    ✓ Counted! Now {received_count}/{expected_count}"
-                                )
-
-                                # Check if we have all responses - break immediately
-                                if received_count >= expected_count:
-                                    self.logger.debug(
-                                        f"✓ Got all {expected_count} responses, exiting read loop"
-                                    )
-                                    break
-
-                            else:
-                                self.logger.warning(
-                                    f"[UNEXPECTED] {json.dumps(msg)[:100]}..."
-                                )
-                        except json.JSONDecodeError as e:
-                            self.logger.error(f"JSON decode error: {e}")
-
-                # Only try to read more if we still need responses
-                if received_count >= expected_count:
-                    break
-
-                try:
-                    chunk = await asyncio.wait_for(self.reader.read(4096), timeout=30)
-                except asyncio.TimeoutError:
-                    self.logger.error(
-                        f"Timeout: got {received_count}/{expected_count} responses"
+        results = []
+        for method, params, request_id in requests_list:
+            try:
+                while True:
+                    response = await asyncio.wait_for(
+                        self._response_queue.get(), timeout=30
                     )
-                    raise RuntimeError(
-                        f"Timeout waiting for batch responses (got {received_count}/{expected_count})"
-                    )
-
-                if not chunk:
-                    if received_count >= expected_count:
+                    msg_id = response.get("id")
+                    if msg_id == request_id:
+                        results.append(response)
                         break
-                    self.logger.error(
-                        f"Connection closed: got {received_count}/{expected_count} responses"
-                    )
-                    raise ConnectionError(
-                        f"Server closed connection after {received_count}/{expected_count} responses"
-                    )
+                    elif msg_id is not None:
+                        self.logger.warning(
+                            f"[UNEXPECTED] Got id={msg_id}, expected {request_id}"
+                        )
+            except asyncio.TimeoutError:
+                self.logger.error(f"Timeout for request {request_id}")
+                results.append({"error": "Timeout"})
 
-                buffer += chunk
-                self.logger.debug(
-                    f"[BUFFER] Received {len(chunk)} bytes, have {received_count}/{expected_count} responses"
-                )
-
-        self.logger.debug(f"✓ Batch complete: got all {expected_count} responses")
-        return [responses.get(req[2]) for req in requests_list]
+        self.logger.debug(f"✓ Batch complete: got {len(results)} responses")
+        return results
 
     async def get_transactions(self, tx_hashes: list[str]) -> list[dict]:
         """Get verbose transaction details for multiple transaction hashes in batch."""
@@ -508,28 +479,19 @@ async def lifespan(app: FastAPI):
 
     # Connect to ElectrumX
     electrum_client = ElectrumXClient(ELECTRUMX_URL)
+
     try:
-        await electrum_client.connect()
+        # Pass callback to connect - it will start the listener before handshake
+        await electrum_client.connect(on_new_block)
 
-        # Subscribe to block headers
-        initial_header = await electrum_client.subscribe_headers(on_new_block)
-        current_block_height = initial_header.get("height", 0)
-        current_block_hex = initial_header.get("hex", "")
+        # Subscribe to block headers (already done in connect, but get the data)
+        current_block_height = electrum_client._current_height
+        current_block_hex = electrum_client._current_hex
         last_block_update = datetime.now(timezone.utc)
-
-        # Start listener task
-        listener_task = asyncio.create_task(electrum_client._listen_loop(on_new_block))
 
         yield
 
         # Cleanup
-        if listener_task:
-            listener_task.cancel()
-            try:
-                await listener_task
-            except asyncio.CancelledError:
-                pass
-
         await electrum_client.disconnect()
     except Exception as e:
         log.error(f"Error: {e}")
