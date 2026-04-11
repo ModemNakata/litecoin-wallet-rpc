@@ -113,6 +113,7 @@ class ElectrumXClient:
         self._reader_task: Optional[asyncio.Task] = None
         self._current_height: int = 0
         self._current_hex: str = ""
+        self._callback = None  # Store callback for reconnection
 
     def _parse_url(self, url: str) -> tuple[str, str, int]:
         """Parse connection URL like ssl://host:port or tcp://host:port."""
@@ -163,6 +164,7 @@ class ElectrumXClient:
 
             # Start listener if callback provided
             if listener_callback:
+                self._callback = listener_callback  # Store for reconnection
                 self._reader_task = asyncio.create_task(
                     self._listen_loop(listener_callback)
                 )
@@ -201,6 +203,8 @@ class ElectrumXClient:
 
     async def disconnect(self):
         """Disconnect from server."""
+        self.connected = False
+
         if self._reader_task:
             self._reader_task.cancel()
             try:
@@ -215,8 +219,78 @@ class ElectrumXClient:
                 self.logger.info("Disconnected")
             except Exception as e:
                 self.logger.warning(f"Error disconnecting: {e}")
-            finally:
-                self.connected = False
+
+    async def reconnect(self, listener_callback=None):
+        """Reconnect to ElectrumX server (with new listener)."""
+        self.logger.info(f"Reconnecting to {self.url}...")
+
+        # Close old writer if exists
+        if self.writer:
+            try:
+                self.writer.close()
+                await self.writer.wait_closed()
+                self.logger.debug("Closed old writer")
+            except Exception as e:
+                self.logger.debug(f"Error closing old writer: {e}")
+
+        # Clear the response queue since it has stale responses
+        while not self._response_queue.empty():
+            try:
+                self._response_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        try:
+            if self.protocol == "ssl":
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                self.reader, self.writer = await asyncio.open_connection(
+                    self.host, self.port, ssl=context
+                )
+            else:
+                self.reader, self.writer = await asyncio.open_connection(
+                    self.host, self.port
+                )
+
+            self.logger.info(f"✓ Reconnected to {self.url}")
+            self.connected = True
+
+            # Wait a bit for connection to stabilize
+            await asyncio.sleep(0.2)
+
+            # Start a new listener task for the new connection
+            if listener_callback:
+                # Cancel old listener if exists
+                if self._reader_task and not self._reader_task.done():
+                    self._reader_task.cancel()
+                    try:
+                        await self._reader_task
+                    except asyncio.CancelledError:
+                        pass
+
+                # Start new listener
+                self._reader_task = asyncio.create_task(
+                    self._listen_loop(listener_callback)
+                )
+                await asyncio.sleep(0.2)
+
+            # Re-subscribe to block headers
+            response = await self._send_request("blockchain.headers.subscribe", [])
+            if "error" in response:
+                raise RuntimeError(f"Header re-subscribe failed: {response['error']}")
+
+            header = response.get("result", {})
+            self._current_height = header.get("height", 0)
+            self._current_hex = header.get("hex", "")
+            self.logger.info(
+                f"✓ Re-subscribed to headers, height: {self._current_height}"
+            )
+
+        except Exception as e:
+            self.logger.error(f"Reconnect failed: {e}")
+            self.connected = False
+            raise
 
     async def _send_request(
         self,
@@ -258,6 +332,26 @@ class ElectrumXClient:
                     )
         except asyncio.TimeoutError:
             raise RuntimeError("Timeout waiting for response")
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            self.logger.warning(
+                f"Connection lost during request: {e}, attempting reconnect..."
+            )
+            self.connected = False
+            await self.reconnect(self._callback)
+            # Retry the request after reconnect
+            self.writer.write(raw_request)
+            await self.writer.drain()
+            while True:
+                response = await asyncio.wait_for(
+                    self._response_queue.get(), timeout=30
+                )
+                msg_id = response.get("id")
+                if msg_id == request_id:
+                    return response
+                elif msg_id is not None:
+                    self.logger.warning(
+                        f"[UNEXPECTED] Got id={msg_id}, expected {request_id}"
+                    )
 
     async def get_history(self, script_hash: str) -> list[dict]:
         """Get transaction history for a script hash."""
@@ -314,8 +408,25 @@ class ElectrumXClient:
             try:
                 chunk = await asyncio.wait_for(self.reader.read(4096), timeout=60)
                 if not chunk:
-                    self.logger.warning("Connection closed, exiting listener")
-                    break
+                    self.logger.warning("Connection closed, attempting to reconnect...")
+                    self.connected = False
+                    # Don't break - attempt reconnection below
+                elif not self.connected:
+                    break  # Already disconnected, skip to reconnection
+
+                if not self.connected:
+                    # Connection was closed, try to reconnect
+                    self.logger.info("Attempting immediate reconnection...")
+                    try:
+                        await self.reconnect(callback)  # Pass callback!
+                        buffer = b""
+                        self.logger.info(
+                            "Reconnected successfully, continuing to listen..."
+                        )
+                        continue  # Continue the while loop with new connection
+                    except Exception as re:
+                        self.logger.error(f"Reconnection failed: {re}")
+                        break
 
                 buffer += chunk
 
@@ -339,14 +450,25 @@ class ElectrumXClient:
                                 await callback(notification)
                         except json.JSONDecodeError:
                             pass
-                        except json.JSONDecodeError:
-                            pass
 
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
                 self.logger.error(f"Listener error: {e}")
-                break
+                self.connected = False
+
+                # Try to reconnect
+                self.logger.info("Attempting immediate reconnection...")
+                try:
+                    await self.reconnect(callback)
+                    buffer = b""
+                    self.logger.info(
+                        "Reconnected successfully, continuing to listen..."
+                    )
+                    continue  # Continue listening
+                except Exception as re:
+                    self.logger.error(f"Reconnection failed: {re}")
+                    break
 
         self.logger.info("Notification listener stopped")
 
@@ -361,19 +483,37 @@ class ElectrumXClient:
         """
         self.logger.debug(f"Batch sending {len(requests_list)} requests")
 
-        for method, params, request_id in requests_list:
-            request = {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": method,
-                "params": params,
-            }
-            raw_request = json.dumps(request).encode("utf-8") + b"\n"
-            self.writer.write(raw_request)
-            self.logger.debug(f"  [{request_id}] {method}")
+        try:
+            for method, params, request_id in requests_list:
+                request = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                }
+                raw_request = json.dumps(request).encode("utf-8") + b"\n"
+                self.writer.write(raw_request)
+                self.logger.debug(f"  [{request_id}] {method}")
 
-        await self.writer.drain()
-        self.logger.debug(f"✓ Sent {len(requests_list)} requests in batch")
+            await self.writer.drain()
+            self.logger.debug(f"✓ Sent {len(requests_list)} requests in batch")
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            self.logger.warning(
+                f"Connection lost during batch send: {e}, reconnecting..."
+            )
+            self.connected = False
+            await self.reconnect(self._callback)
+            # Retry the batch
+            for method, params, request_id in requests_list:
+                request = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                }
+                raw_request = json.dumps(request).encode("utf-8") + b"\n"
+                self.writer.write(raw_request)
+            await self.writer.drain()
 
         responses = {}
         expected_ids = {request_id for _, _, request_id in requests_list}
