@@ -113,7 +113,6 @@ class ElectrumXClient:
         self._reader_task: Optional[asyncio.Task] = None
         self._current_height: int = 0
         self._current_hex: str = ""
-        self._callback = None  # Store callback for reconnection
 
     def _parse_url(self, url: str) -> tuple[str, str, int]:
         """Parse connection URL like ssl://host:port or tcp://host:port."""
@@ -220,74 +219,9 @@ class ElectrumXClient:
             except Exception as e:
                 self.logger.warning(f"Error disconnecting: {e}")
 
-    async def _ensure_connected(self):
-        """Ensure connection is alive, reconnect if needed."""
-        if self.connected:
-            return
-
-        self.logger.info("Connection lost, attempting to reconnect...")
-        await self._do_reconnect()
-
-    async def _do_reconnect(self):
-        """Perform full reconnection: new connection, new listener, re-subscribe."""
-        # Close old writer
-        if self.writer:
-            try:
-                self.writer.close()
-                await self.writer.wait_closed()
-            except Exception:
-                pass
-
-        # Clear stale responses from queue
-        while not self._response_queue.empty():
-            try:
-                self._response_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-
-        # Create new connection
-        if self.protocol == "ssl":
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            self.reader, self.writer = await asyncio.open_connection(
-                self.host, self.port, ssl=context
-            )
-        else:
-            self.reader, self.writer = await asyncio.open_connection(
-                self.host, self.port
-            )
-
-        self.logger.info(f"✓ Reconnected to {self.url}")
-        self.connected = True
-        await asyncio.sleep(0.1)
-
-        # Cancel old listener if exists
-        if self._reader_task and not self._reader_task.done():
-            self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except asyncio.CancelledError:
-                pass
-
-        # Start new listener
-        if self._callback:
-            self._reader_task = asyncio.create_task(self._listen_loop(self._callback))
-            await asyncio.sleep(0.1)
-
-        # Re-subscribe to block headers
-        response = await self._send_request("blockchain.headers.subscribe", [])
-        if "error" in response:
-            raise RuntimeError(f"Header re-subscribe failed: {response['error']}")
-
-        header = response.get("result", {})
-        self._current_height = header.get("height", 0)
-        self._current_hex = header.get("hex", "")
-        self.logger.info(f"✓ Re-subscribed, height: {self._current_height}")
-
     async def reconnect(self, listener_callback=None):
-        """Reconnect to ElectrumX server (kept for backward compatibility)."""
-        await self._do_reconnect()
+        """Reconnect to ElectrumX server."""
+        pass  # Removed reconnection logic
 
     async def _send_request(
         self,
@@ -296,9 +230,6 @@ class ElectrumXClient:
         request_id: Optional[int] = None,
     ) -> dict:
         """Send JSON-RPC request and wait for response."""
-        # Ensure connected before sending
-        await self._ensure_connected()
-
         if params is None:
             params = []
         if request_id is None:
@@ -391,11 +322,7 @@ class ElectrumXClient:
                 chunk = await asyncio.wait_for(self.reader.read(4096), timeout=60)
                 if not chunk:
                     self.logger.warning("Connection closed")
-                    await self._ensure_connected()
-                    if not self.connected:
-                        break
-                    buffer = b""
-                    continue
+                    break
 
                 buffer += chunk
 
@@ -424,10 +351,7 @@ class ElectrumXClient:
                 continue
             except Exception as e:
                 self.logger.error(f"Listener error: {e}")
-                await self._ensure_connected()
-                if not self.connected:
-                    break
-                buffer = b""
+                break
 
         self.logger.info("Notification listener stopped")
 
@@ -440,9 +364,6 @@ class ElectrumXClient:
         Returns:
             List of responses indexed by request_id
         """
-        # Ensure connected before sending
-        await self._ensure_connected()
-
         self.logger.debug(f"Batch sending {len(requests_list)} requests")
 
         for method, params, request_id in requests_list:
