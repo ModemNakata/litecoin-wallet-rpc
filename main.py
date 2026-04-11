@@ -113,6 +113,7 @@ class ElectrumXClient:
         self._reader_task: Optional[asyncio.Task] = None
         self._current_height: int = 0
         self._current_hex: str = ""
+        self._callback = None
 
     def _parse_url(self, url: str) -> tuple[str, str, int]:
         """Parse connection URL like ssl://host:port or tcp://host:port."""
@@ -210,6 +211,7 @@ class ElectrumXClient:
                 await self._reader_task
             except asyncio.CancelledError:
                 pass
+            self._reader_task = None
 
         if self.writer:
             try:
@@ -228,7 +230,19 @@ class ElectrumXClient:
         for attempt in range(max_retries):
             try:
                 self.logger.info(f"Reconnection attempt {attempt + 1}/{max_retries}...")
-                await self.disconnect()
+
+                # Clean up old connection
+                if self.writer:
+                    try:
+                        self.writer.close()
+                        await self.writer.wait_closed()
+                    except Exception:
+                        pass
+                    self.writer = None
+                    self.reader = None
+
+                self.connected = False
+                self._response_queue = asyncio.Queue()
 
                 # Exponential backoff: 2s, 4s, 8s, 16s, 30s (capped)
                 delay = min(base_delay * (2**attempt), 30)
@@ -342,52 +356,52 @@ class ElectrumXClient:
         self.logger.info("Starting notification listener")
         buffer = b""
 
-        while True:
-            try:
-                chunk = await asyncio.wait_for(self.reader.read(4096), timeout=60)
-                if not chunk:
-                    self.logger.warning("Connection closed by server, reconnecting...")
-                    self.connected = False
-                    try:
-                        await self.reconnect(callback)
-                    except Exception as e:
-                        self.logger.error(f"Reconnection failed: {e}")
-                        break
-                    continue
-
-                buffer += chunk
-
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    if line.strip():
-                        try:
-                            msg = json.loads(line.decode("utf-8"))
-                            self.logger.debug(
-                                f"<<< Received: {json.dumps(msg)[:100]}..."
-                            )
-
-                            msg_id = msg.get("id")
-                            if msg_id is not None:
-                                await self._response_queue.put(msg)
-                            elif (
-                                "method" in msg
-                                and msg.get("method") == "blockchain.headers.subscribe"
-                            ):
-                                notification = msg.get("params", [{}])[0]
-                                await callback(notification)
-                        except json.JSONDecodeError:
-                            pass
-
-            except asyncio.TimeoutError:
-                continue
-            except Exception as e:
-                self.logger.error(f"Listener error: {e}")
-                self.connected = False
+        try:
+            while True:
                 try:
-                    await self.reconnect(callback)
-                except Exception as reconnect_error:
-                    self.logger.error(f"Reconnection after error failed: {reconnect_error}")
-                    break
+                    chunk = await asyncio.wait_for(self.reader.read(4096), timeout=60)
+                    if not chunk:
+                        self.logger.warning("Connection closed by server, reconnecting...")
+                        self.connected = False
+                        try:
+                            await self.reconnect(callback)
+                        except Exception as e:
+                            self.logger.error(f"Reconnection failed: {e}")
+                        return  # Old task exits, only the new listener from connect() reads
+
+                    buffer += chunk
+
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        if line.strip():
+                            try:
+                                msg = json.loads(line.decode("utf-8"))
+                                self.logger.debug(
+                                    f"<<< Received: {json.dumps(msg)[:100]}..."
+                                )
+
+                                msg_id = msg.get("id")
+                                if msg_id is not None:
+                                    await self._response_queue.put(msg)
+                                elif (
+                                    "method" in msg
+                                    and msg.get("method") == "blockchain.headers.subscribe"
+                                ):
+                                    notification = msg.get("params", [{}])[0]
+                                    await callback(notification)
+                            except json.JSONDecodeError:
+                                pass
+
+                except asyncio.TimeoutError:
+                    continue
+        except Exception as e:
+            self.logger.error(f"Listener error: {e}")
+            self.connected = False
+            try:
+                await self.reconnect(callback)
+            except Exception as e:
+                self.logger.error(f"Reconnection after error failed: {e}")
+            return  # Old task exits, only the new listener from connect() reads
 
         self.logger.info("Notification listener stopped")
 
