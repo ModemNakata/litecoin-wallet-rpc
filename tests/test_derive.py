@@ -7,7 +7,7 @@ import json
 BASE_URL = "http://127.0.0.1:8101"
 
 # Configuration — change these values to test with your own master private key
-XPRV = "ttpv96BtqegdxXceR42Uyg5hJjrwkDpXtGATzBXDEQa5i1Y917fyPMxE5SjapmUPexgLbhp7SRyETdYSg81b4YRzUmT73MAshbgcVz3dnQWr18z"  # Replace with your BIP84 master private key
+XPRV = "zprvAWgYBBk7JR8GkiSjUUwyhei9mSTEMd5ENS9xywYxsf6WLuFvq9eJjE7eFCjw3sT4AreK7cRiBgF4x8CiL5sPUhwZA3rBhFbKD1poA3iWQCg"  # Replace with your BIP84 master private key
 ACCOUNT_INDEX = 0
 ADDRESS_INDEX = 0
 

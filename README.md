@@ -12,6 +12,7 @@ All script hash conversions are handled in memory. SQLite can optionally be adde
 - **Wallet Derivation**: Uses `bip_utils` for hierarchical deterministic (HD) wallet key derivation (BIP84) — derive addresses from a master private key or account public key
 - **Transaction History**: Get transaction history for multiple wallet addresses in a single batch request
 - **Transaction Details**: Fetch verbose transaction data for multiple tx hashes in a single batch request
+- **Balance Query**: Get confirmed and unconfirmed balances for wallet addresses
 - **Health Check**: Monitor service connectivity
 - **Address-to-Script-Hash Conversion**: P2WPKH support for mainnet and testnet
 - **Comprehensive Error Handling**: Logging, connection recovery (1 reconnection attempt on failure)
@@ -182,6 +183,38 @@ Get verbose transaction details for transaction hashes (batch operation).
   ]
 }
 ```
+
+### `POST /balance`
+
+Get confirmed and unconfirmed balances for wallet addresses.
+
+**Request:**
+```json
+{
+  "addresses": [
+    "tltc1qk8yyn8v267d5sr2tum8tq7djxdqf0vulhth62y",
+    "tltc1qg9dvsx67z38uwzl4xvucktdc5tx66xgduykar4"
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "tltc1qk8yyn8v267d5sr2tum8tq7djxdqf0vulhth62y": {
+    "confirmed": 103873966,
+    "unconfirmed": 23684400,
+    "timestamp": "2026-04-09T20:00:00.000000+00:00"
+  },
+  "tltc1qg9dvsx67z38uwzl4xvucktdc5tx66xgduykar4": {
+    "confirmed": 0,
+    "unconfirmed": 0,
+    "timestamp": "2026-04-09T20:00:00.000000+00:00"
+  }
+}
+```
+
+Balances are returned in satoshis (minimum coin units).
 
 ## Running Tests
 
